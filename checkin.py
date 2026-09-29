@@ -15,6 +15,7 @@
 import html
 import json
 import os
+import re
 import sys
 import time
 from datetime import datetime
@@ -34,10 +35,19 @@ DOMAINS = [
     "https://glados.network",
 ]
 
+DEFAULT_USER_AGENT = (
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+    'AppleWebKit/537.36 (KHTML, like Gecko) '
+    'Chrome/120.0.0.0 Safari/537.36'
+)
+
 HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     'Content-Type': 'application/json;charset=UTF-8',
     'Accept': 'application/json, text/plain, */*',
+    'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+    'Sec-Fetch-Dest': 'empty',
+    'Sec-Fetch-Mode': 'cors',
+    'Sec-Fetch-Site': 'same-origin',
 }
 
 NORMAL_CHECKIN_MESSAGES = (
@@ -57,6 +67,9 @@ EXCHANGE_PLANS = {
 
 EXCHANGE_DISABLED_VALUES = ("", "off", "no", "none", "false", "0", "disabled")
 
+CURRENT_SESSION_COOKIES = ('gld:sess', 'gld:sess.sig')
+LEGACY_SESSION_COOKIES = ('koa:sess', 'koa:sess.sig')
+
 # ================= 工具函数 =================
 
 def log(msg):
@@ -64,21 +77,35 @@ def log(msg):
     print(f"[{ts}] {msg}")
 
 def extract_cookie(raw: str):
-    """提取 Cookie，支持 Cookie-Editor 冒号格式"""
+    """提取 Cookie，支持请求头及 Cookie-Editor JSON 导出格式。"""
     if not raw:
         return None
     raw = raw.strip()
+    raw = re.sub(r'^cookie\s*:\s*', '', raw, flags=re.IGNORECASE)
     
-    # Cookie-Editor 格式 (koa:sess=xxx; koa:sess.sig=yyy)
-    if 'koa:sess=' in raw or 'koa:sess.sig=' in raw:
+    # GLaDOS 2026 新会话与旧 Koa 会话的 Cookie 请求头格式。
+    if any(f'{name}=' in raw for name in CURRENT_SESSION_COOKIES + LEGACY_SESSION_COOKIES):
         return raw
         
-    # JSON
-    if raw.startswith('{'):
+    # Cookie-Editor 的 JSON 数组导出，或旧版 {"token": "..."} 格式。
+    if raw.startswith(('{', '[')):
         try:
-            token = json.loads(raw).get('token')
+            parsed = json.loads(raw)
+            if isinstance(parsed, list):
+                pairs = []
+                for item in parsed:
+                    if not isinstance(item, dict):
+                        continue
+                    name = item.get('name')
+                    value = item.get('value')
+                    if name and value is not None:
+                        pairs.append(f'{name}={value}')
+                cookie = '; '.join(pairs)
+                return cookie if cookie and get_session_cookie_kind(cookie) else None
+
+            token = parsed.get('token') if isinstance(parsed, dict) else None
             return f'koa:sess={token}' if token else None
-        except (json.JSONDecodeError, AttributeError):
+        except (json.JSONDecodeError, AttributeError, TypeError):
             return None
         
     # JWT Token
@@ -87,6 +114,26 @@ def extract_cookie(raw: str):
         
     # Standard
     return raw
+
+
+def get_cookie_names(cookie_header):
+    """Return Cookie names only; values are deliberately never logged."""
+    names = set()
+    for item in cookie_header.split(';'):
+        name, separator, _ = item.strip().partition('=')
+        if separator and name:
+            names.add(name)
+    return names
+
+
+def get_session_cookie_kind(cookie_header):
+    """Identify a complete current or legacy signed session Cookie pair."""
+    names = get_cookie_names(cookie_header)
+    if set(CURRENT_SESSION_COOKIES).issubset(names):
+        return 'gld'
+    if set(LEGACY_SESSION_COOKIES).issubset(names):
+        return 'koa'
+    return None
 
 def get_cookies():
     raw = os.environ.get("GLADOS_COOKIE", "")
@@ -97,6 +144,54 @@ def get_cookies():
     # Split by enter or &
     sep = '\n' if '\n' in raw else '&'
     return [cookie for item in raw.split(sep) if (cookie := extract_cookie(item))]
+
+
+def get_browser_headers():
+    """Build headers matching the browser that created the login session."""
+    user_agent = os.environ.get("GLADOS_USER_AGENT", "").strip() or DEFAULT_USER_AGENT
+    headers = {'User-Agent': user_agent}
+
+    chrome = re.search(r'(?:Chrome|Chromium)/(\d+)', user_agent)
+    if chrome:
+        major = chrome.group(1)
+        if 'Macintosh' in user_agent:
+            platform = 'macOS'
+        elif 'Windows' in user_agent:
+            platform = 'Windows'
+        elif 'Android' in user_agent:
+            platform = 'Android'
+        elif 'Linux' in user_agent:
+            platform = 'Linux'
+        else:
+            platform = 'Unknown'
+
+        headers.update({
+            'Sec-CH-UA': (
+                f'"Chromium";v="{major}", '
+                f'"Google Chrome";v="{major}", '
+                '"Not_A Brand";v="99"'
+            ),
+            'Sec-CH-UA-Mobile': '?1' if 'Mobile' in user_agent else '?0',
+            'Sec-CH-UA-Platform': f'"{platform}"',
+        })
+
+    return headers
+
+
+def is_non_retryable_checkin_result(result):
+    """Return True for authentication/device failures that waiting cannot fix."""
+    if not isinstance(result, dict):
+        return False
+    code = result.get('code')
+    reason = str(result.get('reason', '')).strip().lower()
+    message = str(result.get('message', '')).strip().lower()
+    return (
+        code == -2
+        or reason == 'device-mismatch'
+        or '没有权限' in message
+        or 'permission' in message
+        or 'unauthorized' in message
+    )
 
 
 def is_normal_checkin_result(result):
@@ -123,6 +218,13 @@ def checkin_with_retry(client, attempts=3, delay_seconds=60):
         if is_normal_checkin_result(last_result):
             return last_result, True
 
+        if is_non_retryable_checkin_result(last_result):
+            message = last_result.get('message', '认证失败')
+            if last_result.get('reason') == 'device-mismatch':
+                message = '登录设备不匹配，请重新登录并更新完整 Cookie'
+            log(f"❌ 签到认证失败，不再重试: {message}")
+            return last_result, False
+
         if attempt < attempts:
             log(f"⚠️ 签到第 {attempt}/{attempts} 次失败，{delay_seconds} 秒后重试")
             time.sleep(max(0, delay_seconds))
@@ -142,6 +244,12 @@ class GLaDOS:
         self.exchange_info = ""
         self.exchange_result = ""
         self.plan = "?"
+        self.session_cookie_kind = get_session_cookie_kind(cookie)
+        if self.session_cookie_kind != 'gld':
+            log(
+                "⚠️ Cookie 未包含完整的 gld:sess 与 gld:sess.sig；"
+                "2026-09 新版接口可能返回“没有权限”"
+            )
 
     def req(self, method, path, data=None, form=False):
         """带自动域名切换的请求；form=True 时以表单提交（兑换接口要求）"""
@@ -149,6 +257,7 @@ class GLaDOS:
             try:
                 url = f"{d}{path}"
                 h = HEADERS.copy()
+                h.update(get_browser_headers())
                 h['Cookie'] = self.cookie
                 h['Origin'] = d
                 h['Referer'] = f"{d}/console/checkin"

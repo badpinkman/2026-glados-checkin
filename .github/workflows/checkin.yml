@@ -49,6 +49,8 @@ jobs:
         timeout-minutes: 8
         env:
           GLADOS_COOKIE: ${{ secrets.GLADOS_COOKIE }}
+          # Must match the browser that created the current gld:sess.
+          GLADOS_USER_AGENT: ${{ vars.GLADOS_USER_AGENT }}
           PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
